@@ -16,6 +16,7 @@ import com.example.stressdetector.databinding.ActivityMainBinding
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.FaceLandmark
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -29,6 +30,13 @@ class MainActivity : AppCompatActivity() {
     private var isDetectionRunning = true
     private var currentStressLevel = 25f
     private var frameCounter = 0
+
+    private var neutralEyeNoseDiff: Float = 0f
+    private var isCalibrated = false
+    private var lastRawTension = 0f
+
+    private var lastUpdateFrame = 0
+    private var lastStableTension = 0f
 
     private lateinit var faceDetector: com.google.mlkit.vision.face.FaceDetector
 
@@ -214,6 +222,93 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    fun calibrateNeutralState(face: com.google.mlkit.vision.face.Face) {
+        val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position ?: return
+        val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position ?: return
+        val noseBase = face.getLandmark(FaceLandmark.NOSE_BASE)?.position ?: return
+
+        // Вертикальная дистанция от центра глаз до основания носа в расслабленном состоянии
+        neutralEyeNoseDiff = ((leftEye.y + rightEye.y) / 2f) - noseBase.y
+        isCalibrated = true
+        lastRawTension = 0f
+    }
+
+    /**
+     * Эвристика для оценки напряжения бровей на основе доступных ландамарков.
+     * При стрессе: брови сближаются и приподнимаются → уменьшается расстояние между глазами относительно ширины лица.
+     */
+    private fun calculateEyebrowTension(face: com.google.mlkit.vision.face.Face): Float {
+        if (!isCalibrated) return 0f
+
+        val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
+        val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
+        val noseBase = face.getLandmark(FaceLandmark.NOSE_BASE)?.position
+
+        if (leftEye == null || rightEye == null || noseBase == null) return lastRawTension
+
+        // Текущая вертикальная дистанция
+        val currentDiff = ((leftEye.y + rightEye.y) / 2f) - noseBase.y
+
+        // 🎯 При нахмуривании брови опускаются → currentDiff УМЕНЬШАЕТСЯ
+        // Дельта опускания относительно нейтрального состояния
+        val dropDelta = neutralEyeNoseDiff - currentDiff
+
+        // Нормализация: ~15 пикселей опускания = полное напряжение
+        // (значение подобрано под 640x480, можно масштабировать под ваше разрешение)
+        // Вместо жёсткого 15f:
+        val scaleFactor = face.boundingBox.width() / 20f // адаптация под ширину лица в кадре
+        val tension = (dropDelta / scaleFactor).coerceIn(0f, 1f)
+
+        // ⚡ Мгновенная защита от артефактов детектора:
+        // Если за 1 кадр скачок > 0.25, считаем это шумом и игнорируем
+        val maxAllowedDeltaPerFrame = 0.25f
+        val finalTension = if (tension - lastRawTension > maxAllowedDeltaPerFrame) {
+            lastRawTension // отсекаем выброс, не замедляя пайплайн
+        } else {
+            tension
+        }
+
+
+
+        lastRawTension = finalTension
+        return finalTension
+    }
+
+    private fun calculateSustainedEyebrowTension(face: com.google.mlkit.vision.face.Face): Float {
+        val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position ?: return lastStableTension
+        val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position ?: return lastStableTension
+        val noseBase = face.getLandmark(FaceLandmark.NOSE_BASE)?.position ?: return lastStableTension
+
+        val bbox = face.boundingBox
+
+        // 1️⃣ Нормализуем координаты относительно размера лица (инвариантно к зуму/дистанции)
+        val faceHeight = bbox.height().toFloat()
+        val eyeCenterY = (leftEye.y + rightEye.y) / 2f
+        val normalizedEyeY = (eyeCenterY - bbox.top) / faceHeight // 0.0 = верх лица, 1.0 = низ
+
+        // 2️⃣ При нахмуривании верхняя часть лица "сжимается", глаза оказываются ниже в рамках bbox
+        // Эмпирический порог для фронтальной камеры: >0.32 = брови опущены
+        val positionTension = (normalizedEyeY - 0.32f).coerceIn(0f, 0.4f) / 0.4f
+
+        // 3️⃣ Прокси напряжения: при хмурении глаза естественно сужаются/щурятся
+        val eyeOpenProb = ((face.leftEyeOpenProbability ?: 1f) + (face.rightEyeOpenProbability ?: 1f)) / 2f
+        val squintTension = (0.7f - eyeOpenProb).coerceIn(0f, 0.5f) / 0.5f
+
+        // 4️⃣ Комбинируем (позиция + прищур = устойчивое состояние хмурения)
+        val rawTension = (positionTension * 0.6f + squintTension * 0.4f).coerceIn(0f, 1f)
+
+        // ⚡ Мгновенная защита от единичного шума детектора (не сглаживание, а отсечка артефактов)
+        val maxJump = 0.3f
+        val finalTension = if (rawTension - lastStableTension > maxJump && rawTension > 0.6f) {
+            // Если скачок слишком резкий, берём среднее между прошлым и текущим, но только на 1 кадр
+            (lastStableTension + rawTension) / 2f
+        } else {
+            rawTension
+        }
+
+        lastStableTension = finalTension
+        return finalTension
+    }
     private fun calculateStressFromFace(face: com.google.mlkit.vision.face.Face): Float {
         var stress = 0.35f
 
@@ -242,6 +337,9 @@ class MainActivity : AppCompatActivity() {
         if (Math.abs(headYaw) > 15f) {
             stress += 0.1f
         }
+        // Анализ "напряжения бровей" через геометрию лица
+        val eyebrowTension = calculateSustainedEyebrowTension(face)
+        stress += eyebrowTension * 0.15f // вес фактора бровей
 
         stress = stress.coerceIn(0.1f, 0.9f)
 
