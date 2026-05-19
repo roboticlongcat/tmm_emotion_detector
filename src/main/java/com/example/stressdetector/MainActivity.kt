@@ -4,273 +4,205 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.os.Bundle
 import android.util.Log
-import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
+import android.widget.ProgressBar
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.example.stressdetector.databinding.ActivityMainBinding
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.face.FaceDetection
-import com.google.mlkit.vision.face.FaceDetectorOptions
-import java.nio.ByteBuffer
+import com.example.stressdetector.MediaPipeStressAnalyzer // Убедитесь, что пакет совпадает
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var binding: ActivityMainBinding
+    // 🔹 UI элементы
+    private lateinit var previewView: PreviewView
+    private lateinit var pbStress: ProgressBar
+    private lateinit var tvStressLevel: TextView
+    private lateinit var tvDetails: TextView
+
+    // 🔹 CameraX & Threading
     private lateinit var cameraExecutor: ExecutorService
-    private var imageAnalysis: ImageAnalysis? = null
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var imageAnalyzer: ImageAnalysis? = null
 
-    private var isDetectionRunning = true
-    private var currentStressLevel = 25f
+    // 🔹 Анализатор и состояние
+    private lateinit var stressAnalyzer: MediaPipeStressAnalyzer
     private var frameCounter = 0
-
-    private lateinit var faceDetector: com.google.mlkit.vision.face.FaceDetector
-
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (isGranted) startCamera() else {
-            Toast.makeText(this, "Камера необходима", Toast.LENGTH_LONG).show()
-            finish()
-        }
-    }
+    private var lastStressValue = 0.35f // Стартовое значение (умеренный фон)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
+        setContentView(R.layout.activity_main)
+        initViews()
 
-        setupUI()
-        initializeFaceDetector()
-
+        // Инициализация пула потоков и анализатора
         cameraExecutor = Executors.newSingleThreadExecutor()
-        startCameraIfPermissionGranted()
-    }
+        stressAnalyzer = MediaPipeStressAnalyzer(this)
 
-    private fun initializeFaceDetector() {
-        val options = FaceDetectorOptions.Builder()
-            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.15f)
-            .build()
-
-        faceDetector = FaceDetection.getClient(options)
-        Log.d("MLKit", "✅ Face Detector инициализирован")
-    }
-
-    private fun setupUI() {
-        binding.btnToggleDetection.setOnClickListener {
-            isDetectionRunning = !isDetectionRunning
-            binding.btnToggleDetection.text = if (isDetectionRunning) "Остановить" else "Запустить"
-            Toast.makeText(this, if (isDetectionRunning) "Анализ запущен" else "Анализ остановлен", Toast.LENGTH_SHORT).show()
-        }
-
-        binding.btnResetHistory.setOnClickListener {
-            currentStressLevel = 25f
-            updateUI(currentStressLevel)
-            Toast.makeText(this, "Сброшено к норме", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun startCameraIfPermissionGranted() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+        // Запрос разрешения камеры
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 100)
+        } else {
             startCamera()
-        else
-            requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun initViews() {
+        previewView = findViewById(R.id.previewView)
+        pbStress = findViewById(R.id.pbStress)
+        tvStressLevel = findViewById(R.id.tvStressLevel)
+        tvDetails = findViewById(R.id.tvDetails)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 100 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startCamera()
+        }
     }
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(binding.previewView.surfaceProvider)
-            }
-
-            imageAnalysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        analyzeFrame(imageProxy)
-                    }
-                }
-
-            cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, preview, imageAnalysis)
-            Log.d("Camera", "✅ Камера запущена")
-
+            cameraProvider = cameraProviderFuture.get()
+            bindCameraUseCases()
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun analyzeFrame(imageProxy: ImageProxy) {
-        frameCounter++
+    private fun bindCameraUseCases() {
+        val provider = cameraProvider ?: return
 
-        if (!isDetectionRunning) {
-            imageProxy.close()
-            return
-        }
+        // Превью камеры
+        val preview = Preview.Builder()
+            .build()
+            .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
-        // Обрабатываем каждый 3-й кадр
-        if (frameCounter % 3 != 0) {
-            imageProxy.close()
-            return
-        }
-
-        val bitmap = yuvToBitmap(imageProxy)
-
-        if (bitmap != null) {
-            try {
-                val image = InputImage.fromBitmap(bitmap, 0)
-
-                faceDetector.process(image)
-                    .addOnSuccessListener { faces ->
-                        if (faces.isNotEmpty()) {
-                            val face = faces[0]
-                            val stressLevel = calculateStressFromFace(face)
-                            currentStressLevel = currentStressLevel * 0.7f + stressLevel * 0.3f
-
-                            runOnUiThread {
-                                updateUI(currentStressLevel)
-                                binding.tvConfidence.text = "Лицо обнаружено"
-                            }
-                            Log.d("Stress", "Стресс: ${String.format("%.0f", currentStressLevel)}%")
-                        } else {
-                            runOnUiThread {
-                                binding.tvEmotion.text = "😐 Лицо не обнаружено"
-                                binding.tvConfidence.text = "Посмотрите в камеру"
-                            }
-                        }
-                    }
-                    .addOnFailureListener { e ->
-                        Log.e("Analysis", "Ошибка ML Kit: ${e.message}")
-                    }
-            } catch (e: Exception) {
-                Log.e("Analysis", "Ошибка: ${e.message}")
-            }
-        }
-
-        imageProxy.close()
-    }
-
-    private fun yuvToBitmap(imageProxy: ImageProxy): Bitmap? {
-        try {
-            val yBuffer = imageProxy.planes[0].buffer
-            val uBuffer = imageProxy.planes[1].buffer
-            val vBuffer = imageProxy.planes[2].buffer
-
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
-
-            val yBytes = ByteArray(ySize)
-            val uBytes = ByteArray(uSize)
-            val vBytes = ByteArray(vSize)
-
-            yBuffer.get(yBytes)
-            uBuffer.get(uBytes)
-            vBuffer.get(vBytes)
-
-            val width = imageProxy.width
-            val height = imageProxy.height
-            val pixels = IntArray(width * height)
-
-            var index = 0
-            for (y in 0 until height) {
-                for (x in 0 until width) {
-                    val yIndex = y * width + x
-                    val uvIndex = (y / 2) * (width / 2) + (x / 2)
-
-                    val Y = yBytes[yIndex].toInt() and 0xFF
-                    val U = uBytes[uvIndex].toInt() and 0xFF
-                    val V = vBytes[uvIndex].toInt() and 0xFF
-
-                    // YUV to RGB conversion
-                    var R = (Y + 1.402 * (V - 128)).toInt()
-                    var G = (Y - 0.344 * (U - 128) - 0.714 * (V - 128)).toInt()
-                    var B = (Y + 1.772 * (U - 128)).toInt()
-
-                    R = R.coerceIn(0, 255)
-                    G = G.coerceIn(0, 255)
-                    B = B.coerceIn(0, 255)
-
-                    pixels[index++] = (0xFF shl 24) or (R shl 16) or (G shl 8) or B
+        // Анализ кадров
+        imageAnalyzer = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setTargetResolution(android.util.Size(640, 480)) // Оптимально для MediaPipe
+            .build()
+            .also { analysis ->
+                analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                    processFrame(imageProxy)
                 }
             }
 
-            return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
-
+        try {
+            provider.unbindAll()
+            val cameraSelector = CameraSelector.Builder()
+                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
+                .build()
+            provider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
         } catch (e: Exception) {
-            Log.e("Analysis", "YUV to Bitmap error: ${e.message}")
-            return null
+            Log.e("CAMERA", "Ошибка привязки камеры", e)
         }
     }
 
-    private fun calculateStressFromFace(face: com.google.mlkit.vision.face.Face): Float {
-        var stress = 0.35f
+    private fun processFrame(imageProxy: ImageProxy) {
+        frameCounter++
 
-        // Анализ улыбки
-        val smiling = face.smilingProbability ?: 0.5f
-        when {
-            smiling > 0.7f -> stress -= 0.25f
-            smiling > 0.5f -> stress -= 0.1f
-            smiling < 0.3f -> stress += 0.2f
-            smiling < 0.4f -> stress += 0.1f
+        // Анализируем каждый 3-й кадр (~10 FPS при 30 FPS камеры).
+        // Это убирает лишнюю нагрузку без видимого замедления реакции.
+        if (frameCounter % 3 == 0) {
+            val bitmap = imageProxy.toBitmap()
+            if (bitmap != null) {
+                try {
+                    // 🧠 Получаем метрики
+                    val eyebrowTension = stressAnalyzer.detectEyebrowTension(bitmap)
+                    val smileProb = stressAnalyzer.detectSmileProbability(bitmap)
+
+                    // 📊 Рассчитываем итоговый стресс
+                    val stress = calculateStress(eyebrowTension, smileProb)
+                    lastStressValue = stress
+
+                    // 🖥️ Обновляем UI в главном потоке
+                    runOnUiThread {
+                        updateUI(stress, eyebrowTension, smileProb)
+                    }
+                } catch (e: Exception) {
+                    Log.e("ANALYZER", "Ошибка анализа кадра", e)
+                } finally {
+                    bitmap.recycle() // Освобождаем память
+                }
+            }
         }
-
-        // Анализ открытости глаз
-        val leftEye = face.leftEyeOpenProbability ?: 0.5f
-        val rightEye = face.rightEyeOpenProbability ?: 0.5f
-        val eyesOpen = (leftEye + rightEye) / 2f
-
-        when {
-            eyesOpen < 0.3f -> stress += 0.3f
-            eyesOpen < 0.45f -> stress += 0.15f
-            eyesOpen > 0.7f -> stress -= 0.1f
-        }
-
-        // Анализ положения головы
-        val headYaw = face.headEulerAngleY ?: 0f
-        if (Math.abs(headYaw) > 15f) {
-            stress += 0.1f
-        }
-
-        stress = stress.coerceIn(0.1f, 0.9f)
-
-        return stress * 100
+        imageProxy.close() // Обязательно закрываем прокси
     }
 
-    private fun updateUI(stressPercent: Float) {
-        val percent = stressPercent.toInt()
+    /**
+     * Формула расчёта стресса:
+     * Напряжение бровей (60%) + Отсутствие улыбки (40%)
+     */
+    private fun calculateStress(eyebrowTension: Float, smileProb: Float): Float {
+        val browFactor = eyebrowTension * 0.6f
+        val smileFactor = (1f - smileProb) * 0.4f
+        return (browFactor + smileFactor).coerceIn(0.1f, 0.95f)
+    }
 
-        val (status, message, colorRes) = when (percent) {
-            in 0..25 -> Triple("😊 Спокойствие", "Эмоциональный фон в норме", android.R.color.holo_green_dark)
-            in 26..45 -> Triple("🙂 Лёгкое напряжение", "Небольшие признаки стресса", android.R.color.holo_orange_dark)
-            in 46..65 -> Triple("😐 Умеренный стресс", "Рекомендуется перерыв", android.R.color.holo_orange_light)
-            in 66..85 -> Triple("😟 Высокий стресс", "Требуется внимание", android.R.color.holo_red_dark)
-            else -> Triple("😫 Критический стресс", "Срочно нужна поддержка!", android.R.color.holo_red_light)
+    private fun updateUI(stress: Float, eyebrowTension: Float, smileProb: Float) {
+        val percent = (stress * 100).toInt()
+        pbStress.progress = percent
+
+        // Динамический цвет прогресс-бара
+        val colorRes = when {
+            percent < 30 -> R.color.green
+            percent < 60 -> R.color.orange
+            else -> R.color.red
+        }
+        pbStress.progressTintList = ContextCompat.getColorStateList(this, colorRes)
+
+        // Текст статуса
+        tvStressLevel.text = when {
+            percent < 30 -> "Расслаблен 😌"
+            percent < 50 -> "Лёгкое напряжение 😐"
+            percent < 75 -> "Стресс 😟"
+            else -> "Высокий стресс 🚨"
         }
 
-        binding.tvEmotion.text = status
-        binding.tvConfidence.text = message
-        binding.tvStressLevel.text = "$percent%"
-        binding.progressStress.progress = percent
-
-        val stressColor = ContextCompat.getColor(this, colorRes)
-        binding.progressStress.progressTintList = android.content.res.ColorStateList.valueOf(stressColor)
+        // Детали для отладки/визуализации
+        tvDetails.text = "Брови: ${(eyebrowTension * 100).toInt()}% | Улыбка: ${(smileProb * 100).toInt()}%"
     }
 
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
-        faceDetector.close()
+        if (::stressAnalyzer.isInitialized) {
+            stressAnalyzer.close()
+        }
+    }
+
+    /**
+     * Конвертация ImageProxy (YUV_420_888) → Bitmap
+     * Оптимизировано для Android CameraX
+     */
+    private fun ImageProxy.toBitmap(): Bitmap? {
+        if (format != ImageFormat.YUV_420_888) return null
+
+        val yBuffer = planes[0].buffer
+        val uBuffer = planes[1].buffer
+        val vBuffer = planes[2].buffer
+
+        val nv21 = ByteArray(width * height + 2 * (width / 2) * (height / 2))
+        yBuffer.get(nv21, 0, yBuffer.remaining())
+        vBuffer.get(nv21, yBuffer.remaining(), vBuffer.remaining())
+        uBuffer.get(nv21, yBuffer.remaining() + vBuffer.remaining(), uBuffer.remaining())
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, out)
+
+        return BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
     }
 }
